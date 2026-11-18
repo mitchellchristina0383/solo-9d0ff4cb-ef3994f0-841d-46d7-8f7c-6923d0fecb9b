@@ -32,10 +32,11 @@ def free_port() -> int:
 
 
 class Server:
-    def __init__(self, data_dir: Path, log_dir: Path):
+    def __init__(self, data_dir: Path, log_dir: Path, extra_env=None):
         self.port = free_port()
         self.base = f"http://127.0.0.1:{self.port}"
         env = dict(os.environ, DATA_DIR=str(data_dir), PYTHONPATH=str(ROOT))
+        env.update(extra_env or {})
         self.log = open(log_dir / f"server-{self.port}.log", "wb")
         self.proc = subprocess.Popen(
             [sys.executable, "-m", "uvicorn", "app.main:app",
@@ -84,7 +85,8 @@ def put_chunk(client: httpx.Client, base: str, tid: str, i: int, payload: bytes)
 
 def test_two_processes_concurrent_upload_and_finalize(tmp_path):
     data_dir = tmp_path / "data"
-    s1, s2 = Server(data_dir, tmp_path), Server(data_dir, tmp_path)
+    s1, s2 = (Server(data_dir, tmp_path, {"UPLOADER_DOWNLOAD_RATE": "0"}),
+              Server(data_dir, tmp_path, {"UPLOADER_DOWNLOAD_RATE": "0"}))
     try:
         s1.wait_ready()
         s2.wait_ready()
@@ -146,7 +148,7 @@ def test_kill_restart_mid_upload_and_published_survives(tmp_path):
     data = random.Random(11).randbytes(3 * CHUNK + 1)  # 4 chunks
     chunks = [data[i:i + CHUNK] for i in range(0, len(data), CHUNK)]
 
-    s1 = Server(data_dir, tmp_path)
+    s1 = Server(data_dir, tmp_path, {"UPLOADER_DOWNLOAD_RATE": "0"})
     s1.wait_ready()
     with httpx.Client(timeout=30) as client:
         tid = create_task(client, s1.base, data)
@@ -154,7 +156,7 @@ def test_kill_restart_mid_upload_and_published_survives(tmp_path):
         assert put_chunk(client, s1.base, tid, 1, chunks[1]).status_code == 200
     s1.kill()  # 模拟进程崩溃（kill -9）
 
-    s2 = Server(data_dir, tmp_path)
+    s2 = Server(data_dir, tmp_path, {"UPLOADER_DOWNLOAD_RATE": "0"})
     try:
         s2.wait_ready()
         with httpx.Client(timeout=30) as client:
@@ -167,7 +169,7 @@ def test_kill_restart_mid_upload_and_published_survives(tmp_path):
     finally:
         s2.kill()  # 发布后再崩溃
 
-    s3 = Server(data_dir, tmp_path)
+    s3 = Server(data_dir, tmp_path, {"UPLOADER_DOWNLOAD_RATE": "0"})
     try:
         s3.wait_ready()
         with httpx.Client(timeout=30) as client:
@@ -180,7 +182,8 @@ def test_kill_restart_mid_upload_and_published_survives(tmp_path):
 def test_concurrent_duplicate_same_chunk_across_processes(tmp_path):
     """Same chunk, same content, raced from two processes: all 200, one record."""
     data_dir = tmp_path / "data"
-    s1, s2 = Server(data_dir, tmp_path), Server(data_dir, tmp_path)
+    s1, s2 = (Server(data_dir, tmp_path, {"UPLOADER_DOWNLOAD_RATE": "0"}),
+              Server(data_dir, tmp_path, {"UPLOADER_DOWNLOAD_RATE": "0"}))
     try:
         s1.wait_ready()
         s2.wait_ready()
@@ -199,4 +202,129 @@ def test_concurrent_duplicate_same_chunk_across_processes(tmp_path):
             assert client.get(f"{s1.base}/api/tasks/{tid}/download").content == data
     finally:
         s1.stop()
+        s2.stop()
+
+
+def upload_published(client: httpx.Client, base: str, data: bytes) -> str:
+    tid = create_task(client, base, data)
+    for i in range(0, len(data), CHUNK):
+        assert put_chunk(client, base, tid, i // CHUNK, data[i:i + CHUNK]
+                         ).status_code == 200
+    r = client.post(f"{base}/api/tasks/{tid}/finalize")
+    assert r.status_code == 200 and r.json()["state"] == "published"
+    return tid
+
+
+def test_quarantine_aborts_inflight_download_across_processes(tmp_path):
+    """Slow download in flight on s2 must stop receiving file bytes once the
+    quarantine saved via s1 becomes visible; new downloads are refused."""
+    data_dir = tmp_path / "data"
+    s1, s2 = (Server(data_dir, tmp_path, {"UPLOADER_DOWNLOAD_RATE": "1048576"}),
+              Server(data_dir, tmp_path, {"UPLOADER_DOWNLOAD_RATE": "1048576"}))
+    try:
+        s1.wait_ready()
+        s2.wait_ready()
+        data = random.Random(21).randbytes(16 * CHUNK)  # 16 MiB
+        with httpx.Client(timeout=30) as client:
+            tid = upload_published(client, s1.base, data)
+
+        received = 0
+        aborted = False
+        with httpx.Client(timeout=30) as client:
+            with client.stream(
+                "GET", f"{s2.base}/api/tasks/{tid}/download"
+            ) as resp:
+                assert resp.status_code == 200
+                it = resp.iter_bytes(64 * 1024)
+                for _ in range(4):  # 慢速在途下载：先收到一小部分
+                    received += len(next(it))
+                assert received < len(data)
+
+                # 另一个进程隔离该包（页面确认后状态已持久化）
+                with httpx.Client(timeout=30) as admin:
+                    r = admin.post(f"{s1.base}/api/tasks/{tid}/quarantine",
+                                   json={"reason": "发现敏感配置"})
+                    assert r.status_code == 200, r.text
+                    assert r.json()["state"] == "quarantined"
+
+                # 继续读：连接被中止，收不到完整文件
+                try:
+                    for chunk in it:
+                        received += len(chunk)
+                except httpx.HTTPError:
+                    aborted = True
+        assert aborted, "in-flight download was not aborted after quarantine"
+        assert received < len(data)
+
+        # 新下载一律拒绝（两个进程都拒绝）；文件仍保留在磁盘上
+        with httpx.Client(timeout=30) as client:
+            for base in (s1.base, s2.base):
+                r = client.get(f"{base}/api/tasks/{tid}/download")
+                assert r.status_code == 403
+        assert (data_dir / "published" / tid).read_bytes() == data
+    finally:
+        s1.stop()
+        s2.stop()
+
+
+def test_disconnect_does_not_block_quarantine(tmp_path):
+    """A client that drops its connection mid-download must not prevent the
+    quarantine from taking effect."""
+    data_dir = tmp_path / "data"
+    s1 = Server(data_dir, tmp_path, {"UPLOADER_DOWNLOAD_RATE": "0"})
+    try:
+        s1.wait_ready()
+        data = random.Random(33).randbytes(8 * CHUNK)
+        with httpx.Client(timeout=30) as client:
+            tid = upload_published(client, s1.base, data)
+
+        # 开始下载后粗暴断开连接
+        client = httpx.Client(timeout=30)
+        try:
+            resp = client.send(
+                client.build_request(
+                    "GET", f"{s1.base}/api/tasks/{tid}/download"),
+                stream=True,
+            )
+            assert resp.status_code == 200
+            next(resp.iter_bytes(64 * 1024))
+            resp.close()  # 未读完即断开
+        finally:
+            client.close()
+
+        with httpx.Client(timeout=30) as admin:
+            r = admin.post(f"{s1.base}/api/tasks/{tid}/quarantine",
+                           json={"reason": "敏感配置"})
+            assert r.status_code == 200, r.text
+            assert r.json()["state"] == "quarantined"
+            assert admin.get(
+                f"{s1.base}/api/tasks/{tid}/download").status_code == 403
+    finally:
+        s1.stop()
+
+
+def test_quarantine_survives_kill_and_restart(tmp_path):
+    data_dir = tmp_path / "data"
+    data = random.Random(44).randbytes(2 * CHUNK + 3)
+
+    s1 = Server(data_dir, tmp_path, {"UPLOADER_DOWNLOAD_RATE": "0"})
+    s1.wait_ready()
+    with httpx.Client(timeout=30) as client:
+        tid = upload_published(client, s1.base, data)
+        r = client.post(f"{s1.base}/api/tasks/{tid}/quarantine",
+                        json={"reason": "敏感配置"})
+        assert r.status_code == 200
+    s1.kill()  # kill -9
+
+    s2 = Server(data_dir, tmp_path, {"UPLOADER_DOWNLOAD_RATE": "0"})
+    try:
+        s2.wait_ready()
+        with httpx.Client(timeout=30) as client:
+            st = client.get(f"{s2.base}/api/tasks/{tid}").json()
+            assert st["state"] == "quarantined"
+            assert st["quarantine_reason"] == "敏感配置"
+            assert client.get(
+                f"{s2.base}/api/tasks/{tid}/download").status_code == 403
+            assert (data_dir / "published" / tid).read_bytes() == data
+    finally:
         s2.stop()

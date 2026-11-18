@@ -6,6 +6,9 @@ services:
       - "8000:8000"
     environment:
       DATA_DIR: /data
+      # 每个下载连接的发送限速（字节/秒），用于在途下载隔离时
+      # 限制已灌入内核缓冲、无法收回的字节量；0 表示不限速。
+      UPLOADER_DOWNLOAD_RATE: "2097152"
     volumes:
       - uploader-data:/data
     restart: unless-stopped

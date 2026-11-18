@@ -14,22 +14,30 @@ Safety properties:
     published file appears only via an atomic rename after full
     size+sha256 verification, so a crash or a disk error can never publish a
     partial file and two processes can never produce two different products;
+  * a published package can be quarantined (with a mandatory reason) when it
+    is found to contain sensitive data: the quarantine flag is a durable
+    SQLite write shared by all service processes, new downloads are rejected
+    with 403, and in-flight downloads re-check the flag per streamed chunk
+    and abort instead of sending further file bytes. The file itself is
+    kept on disk for internal investigation;
   * all state lives in SQLite (WAL) and on disk, so restarts resume cleanly
-    and already published packages stay downloadable.
+    and already published packages stay downloadable (unless quarantined).
 """
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import hashlib
 import os
 import re
 import sqlite3
+import urllib.parse
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from . import storage as storage_mod
@@ -40,6 +48,15 @@ CHUNK_SIZE = 1024 * 1024  # 1 MiB
 SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 READ_BUF = 1024 * 1024
+# Download stream slice; the quarantine flag is re-checked before each slice
+# is read, so an in-flight download stops promptly once quarantine is saved.
+STREAM_CHUNK = 256 * 1024
+# Per-download send pace (bytes/sec). The streamer must not burst whole
+# files into kernel/TCP buffers faster than a slow client drains them:
+# bytes already buffered cannot be recalled when a quarantine lands, so the
+# pace bounds how many bytes can still leak after quarantine is saved.
+# 0 disables pacing. Configurable via UPLOADER_DOWNLOAD_RATE.
+DEFAULT_DOWNLOAD_RATE = 2 * 1024 * 1024
 
 
 class CorruptChunk(Exception):
@@ -48,14 +65,51 @@ class CorruptChunk(Exception):
         self.index = index
 
 
+class QuarantineAbort(Exception):
+    """Raised inside the download stream when the package was quarantined
+    mid-flight. Aborting the request (instead of ending the stream cleanly)
+    makes the client see a failed download rather than a silently truncated
+    file."""
+
+
 class CreateTask(BaseModel):
     filename: str = Field(min_length=1, max_length=255)
     size: int = Field(ge=0)
     sha256: str
 
 
+class QuarantineRequest(BaseModel):
+    reason: str = Field(min_length=1, max_length=2000)
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def save_quarantine(conn, task_id: str, reason: str, when: str) -> None:
+    """Persist the quarantine flag (single durable statement, autocommit).
+
+    Choke point monkeypatched by tests to simulate a failed save. If this
+    raises, nothing is committed and the task keeps its previous state.
+    """
+    conn.execute(
+        "UPDATE tasks SET quarantined_at = ?, quarantine_reason = ?"
+        " WHERE id = ? AND state = 'published' AND quarantined_at IS NULL",
+        (when, reason, task_id),
+    )
+
+
+def _effective_state(task) -> str:
+    if task["quarantined_at"]:
+        return "quarantined"
+    return task["state"]
+
+
+def _content_disposition(filename: str) -> str:
+    quoted = urllib.parse.quote(filename)
+    if quoted != filename:
+        return f"attachment; filename*=utf-8''{quoted}"
+    return f'attachment; filename="{filename}"'
 
 
 def _sanitize_filename(name: str) -> str:
@@ -69,8 +123,12 @@ def _expected_chunk_size(task, index: int) -> int:
     return task["size"] - task["chunk_size"] * (task["total_chunks"] - 1)
 
 
-def create_app(data_dir=None) -> FastAPI:
+def create_app(data_dir=None, download_rate=None) -> FastAPI:
     data_dir = Path(data_dir or os.environ.get("DATA_DIR", "data")).resolve()
+    if download_rate is None:
+        download_rate = int(
+            os.environ.get("UPLOADER_DOWNLOAD_RATE", DEFAULT_DOWNLOAD_RATE)
+        )
     storage = Storage(data_dir)
     storage.ensure_dirs()
     init_db(storage.db_path)
@@ -103,11 +161,13 @@ def create_app(data_dir=None) -> FastAPI:
             "received_count": len(received),
             "received_chunks": received,
             "missing_chunks": missing,
-            "state": task["state"],
+            "state": _effective_state(task),
             "created_at": task["created_at"],
             "published_at": task["published_at"],
+            "quarantined_at": task["quarantined_at"],
+            "quarantine_reason": task["quarantine_reason"],
         }
-        if task["state"] == "published":
+        if _effective_state(task) == "published":
             payload["download_url"] = f"/api/tasks/{task['id']}/download"
         return payload
 
@@ -160,9 +220,11 @@ def create_app(data_dir=None) -> FastAPI:
                         "sha256": r["sha256"],
                         "total_chunks": r["total_chunks"],
                         "received_count": r["received"],
-                        "state": r["state"],
+                        "state": _effective_state(r),
                         "created_at": r["created_at"],
                         "published_at": r["published_at"],
+                        "quarantined_at": r["quarantined_at"],
+                        "quarantine_reason": r["quarantine_reason"],
                     }
                     for r in rows
                 ]
@@ -261,6 +323,8 @@ def create_app(data_dir=None) -> FastAPI:
             conn = connect(storage.db_path)
             try:
                 task = get_task_or_404(conn, task_id)
+                if task["quarantined_at"]:
+                    raise HTTPException(409, "task is quarantined")
                 if task["state"] == "published":
                     return {
                         "state": "published",
@@ -385,8 +449,38 @@ def create_app(data_dir=None) -> FastAPI:
         finally:
             lock_file.close()
 
+    @app.post("/api/tasks/{task_id}/quarantine")
+    def quarantine(task_id: str, body: QuarantineRequest):
+        reason = body.reason.strip()
+        if not reason:
+            raise HTTPException(400, "quarantine reason must not be empty")
+        conn = connect(storage.db_path)
+        try:
+            task = get_task_or_404(conn, task_id)
+            if task["quarantined_at"]:
+                # Already quarantined (e.g. two engineers acted at once):
+                # the goal is met, report the persisted record.
+                return status_payload(conn, task)
+            if task["state"] != "published":
+                raise HTTPException(
+                    409,
+                    f"task is '{task['state']}';"
+                    " only published packages can be quarantined",
+                )
+            try:
+                save_quarantine(conn, task_id, reason, _now_iso())
+            except sqlite3.Error as exc:
+                # Save failed: nothing was committed, the task keeps its
+                # previous state; the page must not show success.
+                raise HTTPException(500, f"quarantine save failed: {exc}")
+            # Respond only after the flag is durably stored; re-read the row
+            # so the response reflects what is actually persisted.
+            return status_payload(conn, get_task_or_404(conn, task_id))
+        finally:
+            conn.close()
+
     @app.get("/api/tasks/{task_id}/download")
-    def download(task_id: str):
+    async def download(task_id: str):
         conn = connect(storage.db_path)
         try:
             task = get_task_or_404(conn, task_id)
@@ -394,13 +488,59 @@ def create_app(data_dir=None) -> FastAPI:
             conn.close()
         if task["state"] != "published":
             raise HTTPException(409, f"task is '{task['state']}'; not downloadable")
+        if task["quarantined_at"]:
+            raise HTTPException(
+                403,
+                "package quarantined"
+                f" (reason: {task['quarantine_reason']}); download refused",
+            )
         path = storage.published_path(task_id)
         if not path.exists():
             raise HTTPException(500, "published file missing on disk")
-        return FileResponse(
-            str(path),
-            filename=task["filename"],
+
+        async def stream():
+            # Re-check the quarantine flag (shared via SQLite with all
+            # service processes) before every slice: a download already in
+            # progress stops sending file bytes as soon as a quarantine
+            # saved by any process becomes visible. Slices are paced so the
+            # stream cannot burst far ahead of a slow client — bytes already
+            # handed to the kernel cannot be recalled on quarantine. A
+            # disconnected client cancels this generator; it holds no locks
+            # and never blocks quarantine from taking effect.
+            conn = connect(storage.db_path)
+            interval = STREAM_CHUNK / download_rate if download_rate > 0 else 0
+            loop = asyncio.get_running_loop()
+            next_send = loop.time()
+            try:
+                with open(path, "rb") as f:
+                    while True:
+                        row = conn.execute(
+                            "SELECT quarantined_at FROM tasks WHERE id = ?",
+                            (task_id,),
+                        ).fetchone()
+                        if row is None or row["quarantined_at"] is not None:
+                            raise QuarantineAbort(task_id)
+                        data = await asyncio.to_thread(f.read, STREAM_CHUNK)
+                        if not data:
+                            break
+                        yield data
+                        if interval:
+                            next_send += interval
+                            delay = next_send - loop.time()
+                            if delay > 0:
+                                await asyncio.sleep(delay)
+                        else:
+                            await asyncio.sleep(0)
+            finally:
+                conn.close()
+
+        return StreamingResponse(
+            stream(),
             media_type="application/octet-stream",
+            headers={
+                "Content-Disposition": _content_disposition(task["filename"]),
+                "Content-Length": str(path.stat().st_size),
+            },
         )
 
     @app.get("/", response_class=HTMLResponse)

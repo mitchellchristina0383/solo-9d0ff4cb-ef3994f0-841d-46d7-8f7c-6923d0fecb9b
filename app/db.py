@@ -20,7 +20,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     state         TEXT NOT NULL DEFAULT 'uploading'
                   CHECK (state IN ('uploading', 'published', 'failed')),
     created_at    TEXT NOT NULL,
-    published_at  TEXT
+    published_at  TEXT,
+    quarantined_at     TEXT,
+    quarantine_reason  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS chunks (
@@ -49,5 +51,19 @@ def init_db(db_path) -> None:
     conn = connect(db_path)
     try:
         conn.executescript(SCHEMA)
+        # Columns added after the initial release: ALTER databases that were
+        # created before quarantine support existed. Quarantine stays a flag
+        # on the 'published' state so the original CHECK constraint still
+        # holds and no table rebuild is needed.
+        for column, ddl in (
+            ("quarantined_at", "ALTER TABLE tasks ADD COLUMN quarantined_at TEXT"),
+            (
+                "quarantine_reason",
+                "ALTER TABLE tasks ADD COLUMN quarantine_reason TEXT",
+            ),
+        ):
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
+            if column not in cols:
+                conn.execute(ddl)
     finally:
         conn.close()

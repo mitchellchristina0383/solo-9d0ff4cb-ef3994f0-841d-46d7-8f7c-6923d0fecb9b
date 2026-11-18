@@ -23,6 +23,7 @@
   .st-uploading { background: #f0ad4e22; color: #b87a10; border: 1px solid #b87a1088; }
   .st-published { background: #2e7d3222; color: #2e7d32; border: 1px solid #2e7d3288; }
   .st-failed    { background: #c6282822; color: #c62828; border: 1px solid #c6282888; }
+  .st-quarantined { background: #4a148c22; color: #4a148c; border: 1px solid #4a148c88; }
   .task { border: 1px solid #8884; border-radius: 8px; padding: 12px; margin: 10px 0; }
   .bar { height: 8px; background: #8883; border-radius: 4px; overflow: hidden; margin: 6px 0; }
   .bar > div { height: 100%; background: #2e7d32; width: 0; transition: width .2s; }
@@ -36,9 +37,10 @@
 </style>
 </head>
 <body>
-<h1>事故诊断包上传（1 MiB 分块 · 断点续传 · 校验后发布）</h1>
+<h1>事故诊断包上传（1 MiB 分块 · 断点续传 · 校验后发布 · 可隔离）</h1>
 <p class="muted">创建任务时提交文件大小与 SHA-256；分块上传，刷新或重开页面后可查看已收分块并补齐；
-提交完成时服务端核对分块、总大小与摘要，全部通过才开放下载。摘要不符将拒绝发布，需重新创建任务。</p>
+提交完成时服务端核对分块、总大小与摘要，全部通过才开放下载。摘要不符将拒绝发布，需重新创建任务。
+已发布的包若发现含敏感内容，可填写原因立即隔离：新下载一律拒绝，在途下载中止，文件保留供内部排查。</p>
 
 <section>
   <h2>1. 选择文件并创建任务</h2>
@@ -70,6 +72,7 @@
 <script>
 "use strict";
 const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const hexOf = buf => [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
 const fmtSize = n => n >= 1048576 ? (n/1048576).toFixed(2) + " MiB" : (n/1024).toFixed(1) + " KiB";
 
@@ -188,13 +191,31 @@ async function finalizeTask(taskId) {
   await refreshTasks();
 }
 
+async function quarantineTask(taskId) {
+  const msgEl = document.querySelector(`#msg-${taskId}`);
+  const reason = ($(`qreason-${taskId}`).value || "").trim();
+  if (!reason) {
+    if (msgEl) { msgEl.className = "msg err"; msgEl.textContent = "请填写隔离原因。"; }
+    return;
+  }
+  try {
+    // 只有服务端确认保存（200）后才显示成功；失败则保持原状态。
+    await api("POST", `/api/tasks/${taskId}/quarantine`, { reason });
+    if (msgEl) { msgEl.className = "msg ok"; msgEl.textContent = "已隔离：新下载将被拒绝，在途下载会被中止。"; }
+  } catch (e) {
+    if (msgEl) { msgEl.className = "msg err"; msgEl.textContent = "隔离保存失败，状态未变: " + e.message; }
+  }
+  await refreshTasks();
+}
+
 function taskCard(t) {
   const div = document.createElement("div");
   div.className = "task";
   const pct = t.total_chunks ? Math.round(100 * t.received_count / t.total_chunks) : 100;
+  const stateNames = {uploading:"上传中",published:"已发布",failed:"已拒绝",quarantined:"已隔离"};
   div.innerHTML = `
-    <div><b>${t.filename}</b> · ${fmtSize(t.size)}
-      <span class="badge st-${t.state}">${{uploading:"上传中",published:"已发布",failed:"已拒绝"}[t.state]}</span></div>
+    <div><b>${esc(t.filename)}</b> · ${fmtSize(t.size)}
+      <span class="badge st-${t.state}">${stateNames[t.state] || t.state}</span></div>
     <div class="mono muted">id: ${t.task_id}<br>sha256: ${t.sha256}</div>
     <div class="bar"><div id="bar-${t.task_id}" style="width:${pct}%"></div></div>
     <div class="muted">分块 ${t.received_count}/${t.total_chunks}</div>
@@ -203,9 +224,20 @@ function taskCard(t) {
       ${t.state === "uploading" ? `
         <label>选择文件续传 <input type="file" id="re-${t.task_id}" style="display:none"></label>
         <button id="fin-${t.task_id}">提交完成</button>` : ""}
-      ${t.state === "published" ? `<a class="dl" href="/api/tasks/${t.task_id}/download">下载 ${t.filename}</a>` : ""}
+      ${t.state === "published" ? `
+        <a class="dl" href="/api/tasks/${t.task_id}/download">下载 ${esc(t.filename)}</a>
+        <button id="qbtn-${t.task_id}">隔离</button>` : ""}
       ${t.state === "failed" ? `<span class="msg err">摘要校验未通过，已拒绝发布，请重新创建任务。</span>` : ""}
+      ${t.state === "quarantined" ? `
+        <span class="msg err">已隔离（${esc(t.quarantined_at)}）：${esc(t.quarantine_reason)}</span>
+        <span class="muted">新下载一律拒绝，在途下载中止；文件保留在服务器供内部排查。</span>` : ""}
     </div>
+    ${t.state === "published" ? `
+    <div class="row" id="qform-${t.task_id}" style="display:none">
+      <input type="text" id="qreason-${t.task_id}" placeholder="隔离原因（必填），例如：包含敏感配置" style="flex:1;min-width:260px">
+      <button id="qconfirm-${t.task_id}">确认隔离</button>
+      <button id="qcancel-${t.task_id}">取消</button>
+    </div>` : ""}
     <div class="msg" id="msg-${t.task_id}"></div>`;
   if (t.state === "uploading") {
     div.querySelector(`#re-${t.task_id}`).onchange = ev => {
@@ -213,6 +245,15 @@ function taskCard(t) {
       if (f) uploadMissing(t.task_id, f);
     };
     div.querySelector(`#fin-${t.task_id}`).onclick = () => finalizeTask(t.task_id);
+  }
+  if (t.state === "published") {
+    div.querySelector(`#qbtn-${t.task_id}`).onclick = () => {
+      div.querySelector(`#qform-${t.task_id}`).style.display = "flex";
+    };
+    div.querySelector(`#qcancel-${t.task_id}`).onclick = () => {
+      div.querySelector(`#qform-${t.task_id}`).style.display = "none";
+    };
+    div.querySelector(`#qconfirm-${t.task_id}`).onclick = () => quarantineTask(t.task_id);
   }
   return div;
 }

@@ -1,7 +1,9 @@
 """Functional tests (TestClient): flow, resume, idempotency, conflict,
-finalize verification, disk-failure injection, and restart recovery."""
+finalize verification, disk-failure injection, quarantine, and restart
+recovery."""
 import hashlib
 import random
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -19,7 +21,8 @@ def sha256(b: bytes) -> str:
 
 
 def make_client(tmp_path: Path) -> TestClient:
-    return TestClient(create_app(tmp_path / "data"))
+    # 功能测试关闭下载限速，保持用例快速
+    return TestClient(create_app(tmp_path / "data", download_rate=0))
 
 
 def make_task(client: TestClient, data: bytes, filename="pkg.bin", sha=None) -> str:
@@ -245,3 +248,160 @@ def test_index_page_served(tmp_path):
     c = make_client(tmp_path)
     r = c.get("/")
     assert r.status_code == 200 and "断点续传" in r.text
+
+
+# ---------------------------------------------------------------- quarantine
+
+
+def publish(client, tid, data=DATA):
+    upload_all(client, tid, data)
+    r = client.post(f"/api/tasks/{tid}/finalize")
+    assert r.status_code == 200 and r.json()["state"] == "published"
+
+
+def test_quarantine_blocks_download_and_keeps_file(tmp_path):
+    c = make_client(tmp_path)
+    tid = make_task(c, DATA, filename="diag.tar.gz")
+    publish(c, tid)
+
+    r = c.post(f"/api/tasks/{tid}/quarantine", json={"reason": "包含敏感配置"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["state"] == "quarantined"
+    assert body["quarantine_reason"] == "包含敏感配置"
+    assert body["quarantined_at"]
+    assert "download_url" not in body
+
+    # 新下载一律拒绝
+    dl = c.get(f"/api/tasks/{tid}/download")
+    assert dl.status_code == 403
+    assert "敏感配置" in dl.json()["detail"]
+
+    # 文件保留在磁盘上供内部排查
+    assert (tmp_path / "data" / "published" / tid).read_bytes() == DATA
+
+    # 列表与详情均展示隔离状态与原因
+    st = c.get(f"/api/tasks/{tid}").json()
+    assert st["state"] == "quarantined"
+    assert st["quarantine_reason"] == "包含敏感配置"
+    listed = c.get("/api/tasks").json()["tasks"]
+    assert listed[0]["state"] == "quarantined"
+    assert listed[0]["quarantine_reason"] == "包含敏感配置"
+
+
+def test_quarantine_requires_reason(tmp_path):
+    c = make_client(tmp_path)
+    tid = make_task(c, DATA)
+    publish(c, tid)
+
+    assert c.post(f"/api/tasks/{tid}/quarantine", json={}).status_code == 422
+    assert c.post(
+        f"/api/tasks/{tid}/quarantine", json={"reason": ""}
+    ).status_code == 422
+    assert c.post(
+        f"/api/tasks/{tid}/quarantine", json={"reason": "   "}
+    ).status_code == 400
+
+    # 未隔离：仍可下载
+    assert c.get(f"/api/tasks/{tid}/download").status_code == 200
+
+
+def test_quarantine_only_published_tasks(tmp_path):
+    c = make_client(tmp_path)
+    uploading = make_task(c, DATA)
+    r = c.post(f"/api/tasks/{uploading}/quarantine", json={"reason": "敏感"})
+    assert r.status_code == 409
+
+    failed = make_task(c, DATA, sha=sha256(b"other"))
+    upload_all(c, failed, DATA)
+    assert c.post(f"/api/tasks/{failed}/finalize").json()["state"] == "failed"
+    r = c.post(f"/api/tasks/{failed}/quarantine", json={"reason": "敏感"})
+    assert r.status_code == 409
+
+    assert c.post(
+        f"/api/tasks/{'0'*32}/quarantine", json={"reason": "敏感"}
+    ).status_code == 404
+
+
+def test_quarantine_is_idempotent_and_keeps_first_record(tmp_path):
+    c = make_client(tmp_path)
+    tid = make_task(c, DATA)
+    publish(c, tid)
+
+    r1 = c.post(f"/api/tasks/{tid}/quarantine", json={"reason": "首次原因"})
+    assert r1.status_code == 200
+    r2 = c.post(f"/api/tasks/{tid}/quarantine", json={"reason": "再次原因"})
+    assert r2.status_code == 200
+    body = r2.json()
+    assert body["state"] == "quarantined"
+    assert body["quarantine_reason"] == "首次原因"  # 保留首次记录
+    assert body["quarantined_at"] == r1.json()["quarantined_at"]
+
+
+def test_quarantine_save_failure_keeps_original_state(tmp_path, monkeypatch):
+    c = make_client(tmp_path)
+    tid = make_task(c, DATA)
+    publish(c, tid)
+
+    import app.main as main_mod
+
+    def boom(conn, task_id, reason, when):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(main_mod, "save_quarantine", boom)
+    r = c.post(f"/api/tasks/{tid}/quarantine", json={"reason": "敏感配置"})
+    assert r.status_code == 500
+
+    # 保存失败：状态不变，未留下隔离标记，下载仍可用
+    st = c.get(f"/api/tasks/{tid}").json()
+    assert st["state"] == "published"
+    assert st["quarantined_at"] is None
+    assert c.get(f"/api/tasks/{tid}/download").content == DATA
+
+    monkeypatch.undo()
+    # 恢复后可正常隔离
+    assert c.post(
+        f"/api/tasks/{tid}/quarantine", json={"reason": "敏感配置"}
+    ).status_code == 200
+    assert c.get(f"/api/tasks/{tid}/download").status_code == 403
+
+
+def test_quarantine_survives_restart(tmp_path):
+    c1 = make_client(tmp_path)
+    tid = make_task(c1, DATA)
+    publish(c1, tid)
+    assert c1.post(
+        f"/api/tasks/{tid}/quarantine", json={"reason": "敏感配置"}
+    ).status_code == 200
+
+    # 进程重启：同一数据目录新建 app，隔离依然有效
+    c2 = make_client(tmp_path)
+    st = c2.get(f"/api/tasks/{tid}").json()
+    assert st["state"] == "quarantined"
+    assert st["quarantine_reason"] == "敏感配置"
+    assert c2.get(f"/api/tasks/{tid}/download").status_code == 403
+    assert (tmp_path / "data" / "published" / tid).read_bytes() == DATA
+
+
+def test_quarantine_does_not_affect_other_tasks(tmp_path):
+    c = make_client(tmp_path)
+    bad = make_task(c, DATA, filename="bad.bin")
+    good_data = random.Random(5).randbytes(CHUNK_SIZE + 10)
+    good = make_task(c, good_data, filename="good.bin")
+    publish(c, bad)
+    publish(c, good, good_data)
+
+    assert c.post(
+        f"/api/tasks/{bad}/quarantine", json={"reason": "敏感"}
+    ).status_code == 200
+    assert c.get(f"/api/tasks/{bad}/download").status_code == 403
+
+    # 其他包不受影响：下载、上传、发布正常
+    assert c.get(f"/api/tasks/{good}/download").content == good_data
+    another = make_task(c, DATA, filename="another.bin")
+    publish(c, another)
+    assert c.get(f"/api/tasks/{another}/download").content == DATA
+
+    # 被隔离任务不可再传块、不可再提交
+    assert put(c, bad, 0, chunks_of(DATA)[0]).status_code == 409
+    assert c.post(f"/api/tasks/{bad}/finalize").status_code == 409
